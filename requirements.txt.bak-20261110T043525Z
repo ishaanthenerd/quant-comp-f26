@@ -1,0 +1,5 @@
+fastapi==0.162.2
+uvicorn==0.54.0
+python-multipart==0.0.33
+# only needed to run test_api.py:
+# httpx==0.28.1

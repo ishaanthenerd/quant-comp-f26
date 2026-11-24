@@ -1,0 +1,186 @@
+# Competition API: reference for the frontend
+
+The backend is a FastAPI app on the Google Cloud VM (`http://VM_IP:8000`). **The browser never calls it directly.**
+Vercel serves the site over HTTPS, and browsers block an HTTPS page from calling a plain `http://` address, so the
+frontend's *server side* forwards `/api/*` to the VM. See "Proxying from Vercel" at the bottom.
+
+All requests and responses are JSON, except the file upload (multipart). **Sign-in is Microsoft sign-in, done entirely by the frontend.**
+The backend has no passwords and no sessions: the server-side proxy tells it who the signed-in user is with two headers
+(see "Identity" below). The browser talks to one origin (your Vercel site), so there is no CORS to configure.
+
+## Errors
+
+Every error has the same shape. Show `message` to the user and branch on `error`.
+
+```json
+{ "error": "cooldown", "message": "Please wait 212 s before submitting again.", "retry_after_seconds": 212 }
+```
+
+| HTTP | `error` | When |
+|---|---|---|
+| 400 | `bad_request` | Malformed JSON or missing fields |
+| 400 | `invalid_file` | Not a `.py` file, or not UTF-8 |
+| 400 | `syntax_error` | The file has a Python syntax error (message includes the line number). **Not counted against the limits** |
+| 401 | `not_logged_in` | The proxy sent no user id (the user is not signed in): send them to the sign-in page |
+| 400 | `invalid_name` | Team name does not meet the rules |
+| 403 | `no_team` | Signed in but not on a team yet (offer create/join) |
+| 403 | `wrong_tenant` | The account is from a Microsoft tenant that is not allowed |
+| 403 | `signup_closed` / `teams_full` | Self sign-up is off, or the team cap is reached |
+| 404 | `invalid_code` | No team has that join code |
+| 409 | `already_in_team` / `name_taken` / `team_full` | Create or join conflicts |
+| 429 | `too_many_attempts` | 10 wrong join codes in 10 minutes |
+| 403 | `not_registered` | The Microsoft account is not on any team. Show `message` (it contains the address the backend saw) |
+| 403 | `account_mismatch` | That email is already linked to a different Microsoft account. Tell them to contact the organisers |
+| 403 | `event_not_open` / `event_locked` | Before the start / after the lock |
+| 403 | `results_not_released` | Leaderboard not published yet |
+| 403 | `forbidden` | Missing proxy secret or admin token |
+| 404 | `not_found` | Unknown submission, or one that belongs to another team |
+| 409 | `active_job` | The team already has a submission queued or running |
+| 413 | `too_large` | File over 100 KB |
+| 429 | `cooldown` | Submitted too soon (`retry_after_seconds` included) |
+| 429 | `daily_limit` | 15 submissions in the last 24 hours |
+
+## Endpoints
+
+### `GET /event` (no login needed)
+Use it for the countdown, the open/locked banner, and the limits shown on the upload page.
+```json
+{ "state": "open",                      // "before" | "open" | "locked"
+  "start": "2026-11-11T02:00:00Z", "lock": "2026-11-17T02:00:00Z", "now": "2026-11-12T01:00:00Z",
+  "results_released": false,
+  "limits": { "max_bytes": 102400, "cooldown_seconds": 300, "daily_limit": 15 } }
+```
+Times are UTC (8pm Central is 02:00 UTC the next day). Format them in the viewer's local time, and show Central explicitly.
+
+### `GET /me`  ->  `{"team": "Rocket Club", "email": "alice@uni.edu", "signup": "open"}`
+Use it on page load. `401 not_logged_in` means "not signed in". If `team` is **`null`**, the user is signed in but has no team yet:
+show the "Create a team / Join with a code" page (see Teams below). In `invite` mode (`signup: "invite"`) an unregistered account gets `403 not_registered` instead.
+There are no `/auth/login` or `/auth/logout` endpoints in this mode (they return 404); sign-in and sign-out are the frontend's.
+
+## Identity (what the proxy must send)
+
+For every request from a signed-in user, the server-side route adds:
+
+| Header | Value |
+|---|---|
+| `x-proxy-secret` | The shared secret (on every request, signed in or not) |
+| `x-user-id` | A **stable unique id** from the Microsoft token: `sub`, or `oid` (with `tid`). **Not the email** |
+| `x-user-email` | The user's email address, lowercased. Used for display, and to link accounts the organisers pre-registered by email |
+| `x-user-tenant` | The Microsoft tenant id (`tid` claim). The organisers can restrict the API to one tenant |
+| `x-user-name` | Optional display name, shown to teammates on the team page |
+
+**Sign-up is open by default:** anyone who can sign in creates a team or joins one with a code (below). The organisers can also pre-register emails;
+the first time such a person signs in, they are linked to that team. From then on the `x-user-id` alone decides the team. Teammates share one team's
+submissions and limits.
+
+**Rules for the frontend** (these are security requirements, not style):
+1. Build these headers on the server from the verified session. Never copy `x-user-*` headers from the browser request.
+2. Register the Microsoft app as **single-tenant** (your university only). Microsoft warns that the `email` claim is not guaranteed to be verified and that using it
+   to identify users can let someone impersonate another user, and the issue they found affects multi-tenant apps.
+3. Always send `x-user-tenant` (the token's `tid`). The organisers set `ALLOWED_TENANT_ID` on the backend, so even if the app were misconfigured,
+   accounts from other tenants are refused with `403 wrong_tenant`.
+4. Send the stable id as `x-user-id`. If the token has no `email`, send `preferred_username`. The organisers must register whatever address students actually
+   sign in with, and the `not_registered` message shows the address the backend received, so mismatches are easy to fix.
+
+### Teams (open sign-up)
+A person must be on a team to submit. Accounts can only be on one team, and cannot leave it themselves (the organisers can move people).
+Sign-up closes at the lock. Defaults: up to 5 members per team and 60 teams in total.
+
+| Call | Purpose |
+|---|---|
+| `POST /teams` `{"name": "Rocket Club"}` | Create a team and become its first member. `201 {"team": "Rocket Club", "join_code": "K7M2QX9P"}`. Names: 2 to 30 characters, letters, digits, spaces, `-`, `_`; unique ignoring case |
+| `POST /teams/join` `{"code": "k7m2qx9p"}` | Join an existing team (codes are case-insensitive). `200 {"team": "Rocket Club"}` |
+| `GET /teams/mine` | `{"name", "join_code", "max_size", "members": [{"name": "Sam Lee"}]}` for the user's own team. Show the join code so members can invite teammates |
+
+Suggested flow: sign in, call `GET /me`; if `team` is null show two choices (create a team, or enter a join code); afterwards go to the Submit page.
+
+### `POST /submissions`  (multipart form, field name `file`)
+```js
+const fd = new FormData(); fd.append("file", fileInput.files[0]);
+const res = await fetch("/api/submissions", { method: "POST", body: fd });   // do NOT set content-type yourself
+```
+Success `202`: `{"id": 12, "status": "queued", "created": "2026-11-12T01:02:03Z"}`.
+
+### `GET /submissions`  ->  the team's own submissions, newest first
+```json
+{ "submissions": [
+  { "id": 12, "created": "…", "status": "queued", "queue_position": 2 },
+  { "id": 11, "created": "…", "status": "done",  "pnl": 697.67, "aborted": false, "message": "" },
+  { "id": 10, "created": "…", "status": "error", "pnl": 0.0,    "aborted": true,
+    "message": "Could not load submission:\n  line 1, in <module>: import os\nImportError: import of 'os' is not allowed" } ] }
+```
+`status` is `queued`, `running`, `done` or `error`. **Poll every 3 to 5 seconds while any row is `queued` or `running`**, and stop otherwise.
+`error` with `aborted: true` means the team's code failed or was stopped (it scores PnL 0). It is not a site error.
+
+### `GET /submissions/{id}`  ->  the list fields plus `result` once finished
+```json
+{ "id": 11, "status": "done", "pnl": 697.67, "aborted": false, "message": "", "created": "…",
+  "result": {
+    "pnl": 697.67, "pnl_by_product": { "ALPHA": 120.5, "BETA": 300.2 }, "max_drawdown": 143.9,
+    "limit_violations": 0, "timeouts": 0, "crashes": 0, "errors": 0, "restarts": 0, "invalid": 0,
+    "mean_tick_ms": 0.18, "p99_tick_ms": 0.35, "max_tick_ms": 2.34, "ticks": 1000, "elapsed_s": 0.34,
+    "pnl_curve": [0.0, 3.5, 7.0],       // about 200 points of cumulative PnL: draw this as a line chart
+    "logs": "[t=0] hello from print()\n..." } }
+```
+Suggested display: PnL and max drawdown as headline numbers, the curve as a chart, per-product PnL as a small table,
+`logs` and `message` in a monospace box, and a warning if `p99_tick_ms` is near 100 (the per-tick limit).
+`timeouts`, `errors`, `limit_violations` deserve a visible warning when above zero.
+
+### `GET /leaderboard`  (no login needed)
+`403 results_not_released` until the organiser publishes it, then:
+```json
+{ "leaderboard": [ { "rank": 1, "team": "team07", "pnl": 10760.25, "max_drawdown": 301.2, "aborted": false } ] }
+```
+Show a "Results announced Nov 17" placeholder until then. Teams that aborted appear with `aborted: true` and PnL 0.
+
+### Admin endpoints (`/admin/*`)
+For the organiser only, with an `X-Admin-Token` header. **Do not build UI for them and never put the token in frontend code.**
+
+## Pages to build
+Microsoft sign-in; Create-or-join-a-team page (shown while `team` is null); Team page (join code, members); Submit (upload box, rules and limits from `/event`, submission history with live status, a detail view per submission);
+a static Rules/FAQ page; Leaderboard (placeholder until released). Teams see only their own data.
+
+## Proxying from Vercel
+
+The site calls `/api/...` (same origin). A server-side route forwards it to the VM and adds the secret header.
+Environment variables on Vercel: `BACKEND_URL` (for example `http://VM_IP:8000`) and `PROXY_SECRET` (the organiser will send both).
+
+**Next.js route handler** (`app/api/[...path]/route.ts`). This is a sketch and has not been run against Vercel or a Microsoft login:
+```ts
+export const dynamic = "force-dynamic";
+const BACKEND = process.env.BACKEND_URL!;
+const SECRET = process.env.PROXY_SECRET!;
+
+async function handler(req: Request, ctx: { params: Promise<{ path: string[] }> }) {
+  const { path } = await ctx.params;                       // Next 14: ctx.params.path
+  const target = `${BACKEND}/${path.join("/")}${new URL(req.url).search}`;
+
+  const headers = new Headers({ "x-proxy-secret": SECRET });          // built from scratch: nothing from the browser is copied except content-type
+  const ct = req.headers.get("content-type"); if (ct) headers.set("content-type", ct);
+  const session = await getVerifiedSession();              // however your Microsoft sign-in exposes the signed-in user (null if signed out)
+  if (session) {
+    headers.set("x-user-id", session.userId);              // stable Microsoft id (sub or oid), NOT the email
+    headers.set("x-user-email", session.email.toLowerCase());
+    headers.set("x-user-tenant", session.tenantId);          // the token's tid claim
+    if (session.name) headers.set("x-user-name", session.name);
+  }
+
+  const upstream = await fetch(target, {
+    method: req.method, headers, redirect: "manual", cache: "no-store",
+    body: req.method === "GET" || req.method === "HEAD" ? undefined : await req.arrayBuffer(),
+  });
+  const out = new Headers();
+  const rct = upstream.headers.get("content-type"); if (rct) out.set("content-type", rct);
+  return new Response(upstream.body, { status: upstream.status, headers: out });
+}
+export { handler as GET, handler as POST };
+```
+Signed-out requests simply carry no identity; the backend answers `401 not_logged_in` where a user is required, and `/event` and `/leaderboard` work without one.
+
+A plain `vercel.json` rewrite is **not** an option any more: it cannot add the secret or identity headers.
+
+**Local development:** run the backend yourself: `pip install -r requirements.txt`, then
+`PROXY_SECRET=dev EVENT_START=2020-01-01T00:00:00Z uvicorn app:app --port 8000`, and create a test member with
+`curl -X POST` to `/teams` with the headers `x-proxy-secret: dev`, `x-user-id: any-id`, `x-user-email: you@uni.edu`, to create a team. Open sign-up is the default,
+so you do not need to register anyone.
+(Alternatively set `AUTH_MODE=password` and use `manage.py add-teams --count 3` to get team logins and the cookie-based `/auth/login`; that mode is only for local testing.)

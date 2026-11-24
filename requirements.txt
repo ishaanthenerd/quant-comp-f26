@@ -1,0 +1,6 @@
+fastapi==0.162.2
+uvicorn==0.54.0
+python-multipart==0.0.33
+PyJWT[crypto]==2.10.1
+# only needed to run test_api.py and test_jwt_api.py:
+# httpx==0.28.1
